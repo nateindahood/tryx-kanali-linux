@@ -4,8 +4,8 @@ Run **TRYX KANALI**, the Windows-only control software for TRYX AIO coolers with
 screens (e.g. the **Panorama 360** with its 6.5" AMOLED), on **Linux** with Wine, and let it
 actually reach the cooler. You can then manage the screen and upload custom animations from Linux.
 
-Out of the box, KANALI installs and opens under Wine but never finds the cooler. This project
-works out why and fixes it with a single setup script.
+Out of the box, KANALI installs and opens under Wine but never finds the cooler, and it can't
+read CPU/GPU temperatures. This project works out why and fixes both with a single setup script.
 
 > **Unofficial.** Not affiliated with or supported by TRYX. Use at your own risk, especially
 > anything involving firmware updates.
@@ -14,16 +14,17 @@ works out why and fixes it with a single setup script.
 
 ## ⚠️ Read first
 
-1. **CPU / GPU temperatures will not show on the cooler.** KANALI reads them through
-   LibreHardwareMonitor, which needs a Windows **kernel driver**. Wine cannot run Windows
-   kernel drivers, so this can't be fixed here. Everything that goes over USB to the screen
-   still works. ([FAQ](#does-this-fix-cpugpu-temperatures-on-the-screen))
-2. **Your cooler may need a one-time firmware update, done on Windows, first.** Early units
+1. **Your cooler may need a one-time firmware update, done on Windows, first.** Early units
    shipped with an *Android-based* firmware. Current KANALI (2.x) does **not** offer screen
    management for those; it only offers to migrate the firmware, and that flash can't be done
    from Wine. Run `./tryx-kanali doctor` to see which firmware you have.
    ([FAQ](#kanali-opens-but-theres-no-screen--panorama-section),
    [how to update from Linux with a VM](docs/firmware-update-windows-vm.md))
+2. **CPU/GPU temperatures come from Linux, not from KANALI's own sensor code.** KANALI's sensor
+   library needs a Windows **kernel driver**, which Wine can't run. This project replaces that
+   library with a small stand-in that feeds KANALI the readings Linux already has. CPU and GPU
+   temperature, load and clock work. A few minor readouts (e.g. CPU package power) don't.
+   ([FAQ](#do-cpugpu-temperatures-work))
 
 ---
 
@@ -40,7 +41,8 @@ The installer script:
 2. creates a dedicated Wine prefix `~/.wine-kanali` and installs **.NET Framework 4.8** into it
    (downloads from Microsoft, **10-20 minutes**),
 3. starts the **KANALI installer**. Click through it and keep the default location,
-4. registers your cooler with Wine and adds a **"KANALI"** entry to your app menu.
+4. registers your cooler with Wine and adds a **"KANALI"** entry to your app menu,
+5. sets up the **CPU/GPU temperature bridge** (keeps KANALI's original sensor library as a backup).
 
 Then start **KANALI** from the menu (or `tryx-kanali run`). If the installer already opened
 KANALI, quit it from its tray icon and start it from the menu once, so the cooler gets registered.
@@ -56,7 +58,8 @@ tryx-kanali doctor
 | | |
 |---|---|
 | Wine | 9.0 or newer (64-bit), plus **winetricks** |
-| Tools | `iconv`, `od` (coreutils), `unzip` if you pass a .zip |
+| Tools | `python3`, `iconv`, `od` (coreutils), `unzip` if you pass a .zip |
+| GPU readings | NVIDIA: `nvidia-smi` (comes with the driver) · AMD: `amdgpu` driver |
 | System | systemd/udev with `uaccess` (any mainstream desktop distro) |
 | Cooler | TRYX cooler on the **new TRYX firmware** (USB vendor `391a`), see above |
 
@@ -74,6 +77,7 @@ Install the requirements:
 | `tryx-kanali run` | Start KANALI (what the menu entry runs; registers the cooler first) |
 | `tryx-kanali register` | Register connected coolers with Wine again |
 | `tryx-kanali doctor` | Check the setup and show which firmware/mode the cooler is in |
+| `tryx-kanali sensors status\|on\|off` | Check, enable or disable the CPU/GPU temperature bridge |
 | `tryx-kanali uninstall` | Remove the launcher and udev rule, optionally the Wine prefix |
 
 Set `KANALI_PREFIX=/some/path` to use a different Wine prefix.
@@ -87,9 +91,11 @@ Tested with **TRYX Panorama 360 ARGB** (`PANO`, USB `391a:1011`, firmware **v2.0
 
 - ✅ KANALI detects the cooler and shows the screen manager
 - ✅ Settings changes reach the cooler
+- ✅ CPU temperature, load and clock; GPU temperature, load, clock and power
+  (via the temperature bridge), shown in KANALI and on the cooler screen
 - ❔ Custom animation / media upload: not verified on Linux yet. It uses the same USB
   channel, so it's expected to work. Reports welcome
-- ❌ CPU/GPU temperature and load readouts (needs a Windows kernel driver)
+- ❌ CPU package power, per-core voltages (not available without root on Linux)
 - ⚠️ TRYX online features (cloud library sync, firmware-version check) time out under Wine
 
 Other TRYX screen models (Panorama SE / WB, HOLO, ...) use the same middleware and very
@@ -100,12 +106,35 @@ of `tryx-kanali doctor`.
 
 ## FAQ
 
-### Does this fix CPU/GPU temperatures on the screen?
-No. KANALI's helper (`Screen.exe`) reads sensors with **LibreHardwareMonitor**, which loads a
-Windows **kernel driver** (PawnIO/WinRing0) to read CPU/GPU registers. Wine runs Windows
-programs, not Windows drivers, so that part fails (KANALI's log says
-*"硬件初始化失败，已禁用LibreHardwareMonitor"*, "hardware init failed, LibreHardwareMonitor disabled")
-and only RAM usage is reported. This is a hard limit of Wine, not a configuration problem.
+### Do CPU/GPU temperatures work?
+Yes, through a workaround. KANALI's helper (`Screen.exe`) normally reads sensors with
+**LibreHardwareMonitor**, which loads a Windows **kernel driver** (PawnIO) to read CPU/GPU
+registers. Wine runs Windows programs, not Windows drivers, so that always fails under Wine
+and KANALI only reports RAM usage.
+
+This project replaces `LibreHardwareMonitorLib.dll` inside KANALI with a small stand-in
+([source](sensor-bridge/LibreHardwareMonitorShim/LibreHardwareMonitorShim.cs)) that gives KANALI the
+readings Linux already has. A tiny Linux service, `tryx-sensord`, collects them from
+`k10temp`/`coretemp`, `nvidia-smi` or `amdgpu` about once a second. `tryx-kanali run` starts it
+together with KANALI, and it stops by itself a minute after KANALI closes.
+
+| Reading | Status |
+|---|---|
+| CPU temperature, load, clock | ✅ |
+| GPU temperature, load, clock, power: NVIDIA | ✅ tested |
+| GPU temperature, load, clock, power: AMD (`amdgpu`) | ⚠️ implemented, untested. Reports welcome |
+| Network up/down speed | ✅ |
+| CPU package power | ❌ needs root on Linux (RAPL) |
+| Intel integrated-GPU readings | ❌ not implemented |
+
+To show values on the cooler, add CPU/GPU items to the screen layout in KANALI and click
+**Save** (see the next question). If something looks off: `tryx-kanali sensors status`. To go
+back to KANALI's original library: `tryx-kanali sensors off`.
+
+### I changed the text color (or another label setting) but the cooler doesn't change
+Click the **Save** button in that settings panel. Picking a color only changes the preview;
+nothing is sent to the cooler until you save. The label text can only be black or white
+(KANALI's "white" is a light grey).
 
 ### KANALI opens but there's no screen / Panorama section
 Your cooler is almost certainly on the **old Android firmware**. Check with
@@ -188,6 +217,7 @@ Run `tryx-kanali doctor` first. It covers most problems. Then:
 | winetricks seems stuck installing .NET | Make sure KANALI isn't running; winetricks waits for every Wine program to exit |
 | Cooler on old firmware | See the [firmware update guide](docs/firmware-update-windows-vm.md) |
 | Interface class is not printer (07) | Your model works differently: please open an issue with `doctor` output |
+| Temperatures show 0 | `tryx-kanali sensors status`; start KANALI via the menu / `tryx-kanali run` (that starts `tryx-sensord`) |
 
 ## Uninstall
 

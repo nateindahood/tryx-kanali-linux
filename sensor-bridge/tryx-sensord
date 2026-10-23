@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""tryx-sensord - publish Linux CPU/GPU sensor readings for KANALI running under Wine.
+
+Writes simple key=value lines to /dev/shm/tryx-sensors.txt about once a second.
+The replacement LibreHardwareMonitorLib.dll inside the KANALI Wine prefix reads that
+file (as Z:\\dev\\shm\\tryx-sensors.txt) and hands the values to KANALI, which sends them
+to the cooler's screen.
+
+Sources: hwmon (k10temp/zenpower/coretemp, amdgpu), /proc/stat, cpufreq, /proc/net/dev,
+nvidia-smi for NVIDIA GPUs. Exits on its own once KANALI has not been running for a while.
+
+Usage: tryx-sensord [--once] [--foreground]
+"""
+
+import glob
+import os
+import subprocess
+import sys
+import threading
+import time
+
+OUT = os.environ.get("TRYX_SENSORS_FILE", "/dev/shm/tryx-sensors.txt")
+INTERVAL = 1.0
+IDLE_EXIT_SECONDS = 60  # quit when no KANALI process has been seen for this long
+
+
+def read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def hwmons():
+    for d in glob.glob("/sys/class/hwmon/hwmon*"):
+        yield read(d + "/name", ""), d
+
+
+# ------------------------------------------------------------------- CPU ---
+
+def cpu_name():
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "CPU"
+
+
+def cpu_temp():
+    """Package/die temperature in °C."""
+    prefs = {
+        "k10temp": ["Tdie", "Tctl"],          # AMD Ryzen
+        "zenpower": ["Tdie", "Tctl"],
+        "coretemp": ["Package id 0"],          # Intel
+        "cpu_thermal": [None],                 # ARM / misc
+    }
+    for name, d in hwmons():
+        if name not in prefs:
+            continue
+        labels = {}
+        for lab in glob.glob(d + "/temp*_label"):
+            labels[read(lab, "")] = lab[: -len("_label")] + "_input"
+        for want in prefs[name]:
+            path = labels.get(want) if want else d + "/temp1_input"
+            v = read(path) if path else None
+            if v:
+                return int(v) / 1000.0
+        v = read(d + "/temp1_input")
+        if v:
+            return int(v) / 1000.0
+    for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+        if read(z + "/type") in ("x86_pkg_temp", "acpitz"):
+            v = read(z + "/temp")
+            if v:
+                return int(v) / 1000.0
+    return None
+
+
+class CpuLoad:
+    def __init__(self):
+        self.prev = self._sample()
+
+    @staticmethod
+    def _sample():
+        with open("/proc/stat") as f:
+            parts = [int(x) for x in f.readline().split()[1:]]
+        idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
+        return idle, sum(parts)
+
+    def get(self):
+        idle, total = self._sample()
+        pidle, ptotal = self.prev
+        self.prev = (idle, total)
+        dt = total - ptotal
+        return 100.0 * (1 - (idle - pidle) / dt) if dt > 0 else None
+
+
+def cpu_clock():
+    """Average current core clock in MHz."""
+    vals = [int(v) for v in (read(p) for p in glob.glob(
+        "/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq")) if v]
+    if vals:
+        return sum(vals) / len(vals) / 1000.0
+    try:
+        with open("/proc/cpuinfo") as f:
+            mhz = [float(l.split(":")[1]) for l in f if l.startswith("cpu MHz")]
+        return sum(mhz) / len(mhz) if mhz else None
+    except OSError:
+        return None
+
+
+class CpuPower:
+    """Package power from RAPL energy counters (often root-only; then unavailable)."""
+
+    def __init__(self):
+        self.path = None
+        for p in glob.glob("/sys/class/powercap/*/energy_uj"):
+            name = read(os.path.dirname(p) + "/name", "")
+            if name.startswith("package") and read(p) is not None:
+                self.path = p
+                break
+        self.prev = None
+
+    def get(self):
+        if not self.path:
+            return None
+        e, t = read(self.path), time.monotonic()
+        if e is None:
+            return None
+        e = int(e)
+        prev, self.prev = self.prev, (e, t)
+        if not prev or e < prev[0]:
+            return None
+        return (e - prev[0]) / 1e6 / (t - prev[1])
+
+
+# ------------------------------------------------------------------- GPU ---
+
+class NvidiaSmi:
+    """Keeps one `nvidia-smi -lms` process running and remembers its latest line."""
+
+    FIELDS = "name,temperature.gpu,utilization.gpu,clocks.gr,power.draw,memory.total"
+
+    def __init__(self):
+        self.latest = None
+        self.proc = None
+        try:
+            self.proc = subprocess.Popen(
+                ["nvidia-smi", "--query-gpu=" + self.FIELDS, "--format=csv,noheader,nounits",
+                 "-lms", str(int(INTERVAL * 1000))],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            return
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        for line in self.proc.stdout:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 6:
+                self.latest = parts
+
+    def get(self):
+        if not self.latest:
+            return None
+        name, temp, load, clock, power, vram = self.latest[:6]
+
+        def num(x):
+            try:
+                return float(x)
+            except ValueError:
+                return None
+        v = num(vram)
+        return {"vendor": "nvidia", "name": name, "temp": num(temp), "load": num(load),
+                "clock": num(clock), "power": num(power),
+                "vram_bytes": v * 1024 * 1024 if v else None}
+
+
+def amdgpu():
+    best = None
+    for name, d in hwmons():
+        if name != "amdgpu":
+            continue
+        dev = os.path.realpath(d + "/device")
+        vram = int(read(dev + "/mem_info_vram_total", "0") or 0)
+        if best and vram <= best[2]:
+            continue
+        best = (d, dev, vram)
+    if not best:
+        return None
+    d, dev, vram = best
+    temps = {read(l, ""): l[: -len("_label")] + "_input" for l in glob.glob(d + "/temp*_label")}
+    t = read(temps.get("edge") or temps.get("junction") or d + "/temp1_input")
+    p = read(d + "/power1_average") or read(d + "/power1_input")
+    f = read(d + "/freq1_input")
+    busy = read(dev + "/gpu_busy_percent")
+    # KANALI decides discrete vs integrated for AMD from the name ("RX", "XT", "Pro", "Vega")
+    name = "AMD Radeon RX (amdgpu)" if vram > 2 * 1024 ** 3 else "AMD Radeon Graphics (amdgpu)"
+    return {"vendor": "amd", "name": name,
+            "temp": int(t) / 1000.0 if t else None,
+            "load": float(busy) if busy else None,
+            "clock": int(f) / 1e6 if f else None,
+            "power": int(p) / 1e6 if p else None,
+            "vram_bytes": vram or None}
+
+
+# ------------------------------------------------------- network / memory ---
+
+class NetRate:
+    def __init__(self):
+        self.prev = self._sample()
+
+    @staticmethod
+    def _sample():
+        rx = tx = 0
+        with open("/proc/net/dev") as f:
+            for line in f.readlines()[2:]:
+                iface, data = line.split(":", 1)
+                iface = iface.strip()
+                if iface == "lo" or iface.startswith(("veth", "docker", "virbr", "br-")):
+                    continue
+                cols = data.split()
+                rx += int(cols[0]); tx += int(cols[8])
+        return rx, tx, time.monotonic()
+
+    def get(self):
+        rx, tx, t = self._sample()
+        prx, ptx, pt = self.prev
+        self.prev = (rx, tx, t)
+        dt = t - pt
+        return ((tx - ptx) / dt, (rx - prx) / dt) if dt > 0 else (None, None)
+
+
+def mem_used_gb():
+    info = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            info[k] = int(v.split()[0])
+    return (info["MemTotal"] - info.get("MemAvailable", info["MemFree"])) / 1024 / 1024
+
+
+# ------------------------------------------------------------------- main ---
+
+def kanali_running():
+    for p in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            with open(p, "rb") as f:
+                if b"KANALI.exe" in f.read():
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def fmt(v):
+    return "" if v is None else ("%.1f" % v if isinstance(v, float) else str(v))
+
+
+def main():
+    once = "--once" in sys.argv
+    foreground = once or "--foreground" in sys.argv
+    load, power, net = CpuLoad(), CpuPower(), NetRate()
+    nv = NvidiaSmi() if not once and subprocess.call(
+        ["sh", "-c", "command -v nvidia-smi"], stdout=subprocess.DEVNULL) == 0 else None
+    name = cpu_name()
+    last_seen = time.monotonic()
+    time.sleep(0.5 if once else INTERVAL)
+    while True:
+        if once and nv is None and subprocess.call(
+                ["sh", "-c", "command -v nvidia-smi"], stdout=subprocess.DEVNULL) == 0:
+            nv = NvidiaSmi()
+            for _ in range(30):
+                if nv.latest:
+                    break
+                time.sleep(0.1)
+        gpu = (nv.get() if nv else None) or amdgpu() or {}
+        up, down = net.get()
+        values = {
+            "ts": "%.0f" % time.time(),
+            "cpu.name": name,
+            "cpu.temp": cpu_temp(),
+            "cpu.load": load.get(),
+            "cpu.clock": cpu_clock(),
+            "cpu.power": power.get(),
+            "gpu.vendor": gpu.get("vendor"),
+            "gpu.name": gpu.get("name"),
+            "gpu.temp": gpu.get("temp"),
+            "gpu.load": gpu.get("load"),
+            "gpu.clock": gpu.get("clock"),
+            "gpu.power": gpu.get("power"),
+            "gpu.vram_bytes": gpu.get("vram_bytes"),
+            "net.up": up,
+            "net.down": down,
+            "mem.used_gb": mem_used_gb(),
+        }
+        text = "".join("%s=%s\n" % (k, fmt(v)) for k, v in values.items())
+        if once:
+            sys.stdout.write(text)
+            return
+        tmp = OUT + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, OUT)
+
+        if kanali_running():
+            last_seen = time.monotonic()
+        elif not foreground and time.monotonic() - last_seen > IDLE_EXIT_SECONDS:
+            break
+        time.sleep(INTERVAL)
+    if nv and nv.proc:
+        nv.proc.terminate()
+
+
+if __name__ == "__main__":
+    main()

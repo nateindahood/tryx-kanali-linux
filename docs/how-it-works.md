@@ -70,9 +70,35 @@ flow only (`CMD_Ntf_DevOnline` → `panoRK:deviceOnline`) and never adds them to
 device list. So there's no screen management on that firmware, whatever you do on the Linux side.
 This project therefore doesn't install the serial shim. Update the firmware instead.
 
+## The temperature bridge
+
+`Screen.exe` gets all CPU/GPU readings from `LibreHardwareMonitorLib.dll` (LibreHardwareMonitor),
+which reads hardware registers through the PawnIO kernel driver. Under Wine `Computer.Open()`
+fails (`NullReferenceException`), KANALI logs *"LibreHardwareMonitor 初始化已降级"* ("initialization
+degraded") and falls back to WMI, which only gives RAM figures. It also tries to run the PawnIO
+driver installer on every start.
+
+The library isn't strong-name signed, so a replacement with the same assembly name loads fine.
+`sensor-bridge/LibreHardwareMonitorShim` implements exactly the surface `Screen.exe` uses (found by
+listing its IL member references):
+
+- `Computer` (`Is*Enabled` setters, `Open`, `Close`, `Hardware` → `IList<IHardware>`)
+- `IHardware` (`HardwareType`, `Name`, `Sensors` → `ISensor[]`, `Update`)
+- `ISensor` (`Name`, `SensorType`, `Value` → `float?`)
+- `HardwareType` / `SensorType` enums with the **same member order** (values are compiled into `Screen.exe`)
+- `PawnIo.Version` / `IsInstalled` (reports 2.2.0.0 so KANALI skips the driver installer)
+
+Sensor names follow what `Screen.exe` matches on: `CPU Total` (load), `Core (Tctl/Tdie)`
+(temperature, any `Core*`), `Cores (Average)` (clock), `Package` (power), `GPU Core`
+(load/temperature/clock), `GPU Package` (power), `Upload Speed`/`Download Speed`.
+
+Values come from `/dev/shm/tryx-sensors.txt` (`Z:\dev\shm\tryx-sensors.txt` inside Wine), written
+by `sensor-bridge/tryx-sensord` once a second. Data older than 15 s is ignored. From there the
+values follow KANALI's normal path: `Screen.exe` `dynamic` → UI → `CMD_Update_UIItemText` to the
+cooler, sent every second while the screen layout contains system-info labels.
+
 ## Known limitations
 
-- **Temperatures:** `Screen.exe` → LibreHardwareMonitor needs a kernel driver (PawnIO/WinRing0).
-  Not possible under Wine. A Linux-side sensor bridge (hwmon → KANALI) would be a possible future project.
+- **CPU package power:** RAPL energy counters are root-only on current kernels.
 - **TRYX cloud API:** requests from KANALI under Wine time out (`数据请求超时`, "request timed out"), although the
   API is reachable from Linux. Not investigated yet.

@@ -6,13 +6,14 @@
 #         tryx-kanali run          (start KANALI; what the menu entry runs)
 #         tryx-kanali register     (re-register connected coolers with Wine)
 #         tryx-kanali doctor       (diagnose setup and cooler state)
+#         tryx-kanali sensors on|off|status  (CPU/GPU temperature bridge)
 #         tryx-kanali uninstall
 #
 # Unofficial project, not affiliated with Tryx. https://github.com/nateindahood/tryx-kanali-linux
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PREFIX="${KANALI_PREFIX:-$HOME/.wine-kanali}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 STATE_DIR="$DATA_HOME/tryx-kanali"
@@ -20,6 +21,10 @@ BIN_DIR="$HOME/.local/bin"
 DESKTOP_FILE="$DATA_HOME/applications/tryx-kanali.desktop"
 UDEV_RULE="/etc/udev/rules.d/70-tryx-kanali.rules"
 KANALI_DIR="$PREFIX/drive_c/Program Files/KANALI"
+CONNECT_DIR="$KANALI_DIR/resources/Connect"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+LHM_DLL="LibreHardwareMonitorLib.dll"
+SENSOR_FILE="/dev/shm/tryx-sensors.txt"
 
 TRYX_VID="391a"
 # GUID_DEVINTERFACE_USB_DEVICE - KANALI's middleware (UDB.exe) enumerates this
@@ -138,6 +143,86 @@ cmd_register() {
     return 0
 }
 
+# ---------------------------------------------------------- sensor bridge ---
+# KANALI reads CPU/GPU sensors through LibreHardwareMonitorLib.dll, which needs a Windows
+# kernel driver that Wine can't load. We swap in a small stand-in DLL (source in
+# sensor-bridge/) that serves readings published by tryx-sensord (Linux hwmon,
+# nvidia-smi) through /dev/shm/tryx-sensors.txt. The original DLL is kept as *.orig.
+
+is_shim() { grep -q 'tryx-kanali-linux' "$1" 2>/dev/null; }
+
+install_sensor_files() {
+    local src="$SCRIPT_DIR/sensor-bridge"
+    if [ ! -f "$src/tryx-sensord" ] || [ ! -f "$src/$LHM_DLL" ]; then
+        warn "sensor-bridge/ not found next to this script - CPU/GPU temperatures not set up"
+        return 1
+    fi
+    mkdir -p "$STATE_DIR"
+    install -m 0755 "$src/tryx-sensord" "$STATE_DIR/tryx-sensord"
+    install -m 0644 "$src/$LHM_DLL" "$STATE_DIR/$LHM_DLL"
+}
+
+# Put the stand-in DLL in place (again, if a KANALI update restored the original).
+apply_sensor_shim() {
+    local dll="$CONNECT_DIR/$LHM_DLL" shim="$STATE_DIR/$LHM_DLL"
+    [ -f "$shim" ] && [ -d "$CONNECT_DIR" ] || return 0
+    [ -f "$STATE_DIR/sensors-off" ] && return 0
+    cmp -s "$shim" "$dll" && return 0
+    # Back up the real library (or the newer one a KANALI update brought), never an old shim
+    if [ -f "$dll" ] && ! is_shim "$dll"; then cp -p "$dll" "$dll.orig"; fi
+    cp "$shim" "$dll"
+}
+
+restore_original_lhm() {
+    local dll="$CONNECT_DIR/$LHM_DLL"
+    if [ -f "$dll.orig" ] && is_shim "$dll"; then cp -p "$dll.orig" "$dll"; fi
+    return 0
+}
+
+sensord_running() { pgrep -f 'tryx-kanali/tryx-sensord' >/dev/null; }
+
+start_sensord() {
+    [ -x "$STATE_DIR/tryx-sensord" ] && [ ! -f "$STATE_DIR/sensors-off" ] || return 0
+    command -v python3 >/dev/null || { warn "python3 missing - no CPU/GPU temperatures"; return 0; }
+    if ! sensord_running; then
+        setsid -f python3 -I "$STATE_DIR/tryx-sensord" </dev/null >/dev/null 2>&1
+    fi
+    local i
+    for i in $(seq 30); do [ -s "$SENSOR_FILE" ] && break; sleep 0.1; done
+    return 0
+}
+
+cmd_sensors() {
+    case "${1:-status}" in
+        on)
+            rm -f "$STATE_DIR/sensors-off"
+            [ -f "$STATE_DIR/$LHM_DLL" ] || install_sensor_files || die "run this from the repo checkout once: ./tryx-kanali sensors on"
+            apply_sensor_shim; start_sensord
+            ok "Temperature bridge on (restart KANALI to pick it up)" ;;
+        off)
+            mkdir -p "$STATE_DIR"; touch "$STATE_DIR/sensors-off"
+            pkill -f 'tryx-kanali/tryx-sensord' 2>/dev/null || true
+            restore_original_lhm
+            ok "Temperature bridge off, original LibreHardwareMonitorLib.dll restored (restart KANALI)" ;;
+        status) sensors_report ;;
+        *) die "Usage: tryx-kanali sensors on|off|status" ;;
+    esac
+}
+
+sensors_report() {
+    local dll="$CONNECT_DIR/$LHM_DLL" age
+    if [ -f "$STATE_DIR/sensors-off" ]; then warn "temperature bridge switched off (tryx-kanali sensors on)"; return 0; fi
+    if [ -f "$dll" ] && is_shim "$dll"; then ok "stand-in $LHM_DLL installed (original kept as .orig)"
+    elif [ -f "$dll" ]; then bad "original $LHM_DLL in place - temperatures won't work (tryx-kanali run fixes it)"
+    else bad "$LHM_DLL not found in KANALI"; fi
+    sensord_running && ok "tryx-sensord running" || warn "tryx-sensord not running (it starts with tryx-kanali run)"
+    if [ -s "$SENSOR_FILE" ]; then
+        age=$(( $(date +%s) - $(sed -n 's/^ts=//p' "$SENSOR_FILE") ))
+        ok "readings (${age}s old): CPU $(sed -n 's/^cpu.temp=//p' "$SENSOR_FILE")°C $(sed -n 's/^cpu.load=//p' "$SENSOR_FILE")%, GPU $(sed -n 's/^gpu.temp=//p' "$SENSOR_FILE")°C $(sed -n 's/^gpu.load=//p' "$SENSOR_FILE")% ($(sed -n 's/^gpu.name=//p' "$SENSOR_FILE"))"
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- install ---
 
 install_udev_rule() {
@@ -200,7 +285,7 @@ cmd_install() {
     src=$(readlink -f "$src")
 
     info "Checking requirements"
-    for c in wine winetricks iconv od; do command -v "$c" >/dev/null || missing+=("$c"); done
+    for c in wine winetricks iconv od python3; do command -v "$c" >/dev/null || missing+=("$c"); done
     [[ "$src" == *.zip ]] && ! command -v unzip >/dev/null && missing+=(unzip)
     [ ${#missing[@]} = 0 ] || die "Missing: ${missing[*]}  (see README: Requirements)"
     ok "$(wine --version)"
@@ -249,6 +334,12 @@ cmd_install() {
     hide_installer_menu_entries
     install_launcher
 
+    info "Setting up the CPU/GPU temperature bridge"
+    if install_sensor_files; then
+        apply_sensor_shim
+        ok "stand-in $LHM_DLL installed (original kept as $LHM_DLL.orig)"
+    fi
+
     info "Registering connected Tryx devices with Wine"
     cmd_register
 
@@ -272,6 +363,8 @@ cmd_run() {
         esac
     done < <(scan_devices)
     cmd_register quiet
+    apply_sensor_shim
+    start_sensord
     wine_env
     cd "$KANALI_DIR"
     exec wine KANALI.exe "$@"
@@ -327,6 +420,11 @@ cmd_doctor() {
     done < <(scan_devices)
     [ $any = 1 ] || bad "No Tryx cooler found on USB. Check the cooler's USB cable to the motherboard header."
 
+    if kanali_installed; then
+        echo; echo "${B}CPU/GPU temperature bridge${N}"
+        sensors_report
+    fi
+
     log=$(ls -t "$PREFIX"/drive_c/users/*/AppData/Roaming/kanali/logs/udb_*.log 2>/dev/null | head -1 || true)
     if [ -n "$log" ]; then
         echo; echo "${B}Last device events in KANALI middleware log${N} ($log)"
@@ -338,6 +436,10 @@ cmd_doctor() {
 
 cmd_uninstall() {
     local ans
+    info "Stopping the temperature bridge and restoring the original $LHM_DLL"
+    pkill -f 'tryx-kanali/tryx-sensord' 2>/dev/null || true
+    restore_original_lhm
+    rm -f "$SENSOR_FILE"
     info "Removing tryx-kanali launcher and menu entry"
     rm -f "$DESKTOP_FILE" "$BIN_DIR/tryx-kanali"
     rm -rf "$STATE_DIR"
@@ -363,7 +465,8 @@ case "${1:-}" in
     run)       shift; cmd_run "$@" ;;
     register)  cmd_register ;;
     doctor)    cmd_doctor ;;
+    sensors)   cmd_sensors "${2:-status}" ;;
     uninstall) cmd_uninstall ;;
     version|--version) echo "tryx-kanali $VERSION" ;;
-    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

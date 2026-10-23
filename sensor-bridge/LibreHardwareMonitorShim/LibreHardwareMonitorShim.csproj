@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Build: dotnet build -c Release  (needs the .NET SDK; works on Linux) -->
+  <PropertyGroup>
+    <TargetFramework>net46</TargetFramework>
+    <AssemblyName>LibreHardwareMonitorLib</AssemblyName>
+    <RootNamespace>LibreHardwareMonitor</RootNamespace>
+    <AssemblyVersion>0.9.4.0</AssemblyVersion>
+    <FileVersion>0.9.4.0</FileVersion>
+    <Product>tryx-kanali-linux LibreHardwareMonitor stand-in</Product>
+    <LangVersion>7.3</LangVersion>
+    <Deterministic>true</Deterministic>
+    <Nullable>disable</Nullable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
