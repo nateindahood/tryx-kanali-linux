@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 PREFIX="${KANALI_PREFIX:-$HOME/.wine-kanali}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 STATE_DIR="$DATA_HOME/tryx-kanali"
@@ -25,6 +25,8 @@ CONNECT_DIR="$KANALI_DIR/resources/Connect"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 LHM_DLL="LibreHardwareMonitorLib.dll"
 SENSOR_FILE="/dev/shm/tryx-sensors.txt"
+RESOURCES_DIR="$KANALI_DIR/resources"
+BOOT_TARGET="../tryxboot.js"
 
 TRYX_VID="391a"
 # GUID_DEVINTERFACE_USB_DEVICE - KANALI's middleware (UDB.exe) enumerates this
@@ -141,6 +143,45 @@ cmd_register() {
         warn "No Tryx device on new firmware (USB vendor $TRYX_VID) found. Run: tryx-kanali doctor"
     fi
     return 0
+}
+
+# ------------------------------------------------------ main-process fix ---
+# Wine bug: enabling TCP keep-alive before a socket connects makes the connect fail
+# ("connect UNKNOWN"). KANALI's axios does that for every request from its main process
+# (GIPHY downloads, TRYX cloud API, firmware checks), so all of them failed. We point the
+# "main" entry of resources/app.asar/package.json at a small bootstrap
+# (kanali-patch/tryx-bootstrap.js -> resources/tryxboot.js) that defers keep-alive until
+# connected and then starts KANALI's original entry point. Same-length in-place edit
+# (kanali-patch/asar-main.py); KANALI's code itself is untouched. Re-applied on every run,
+# so it survives KANALI updates.
+
+install_patch_files() {
+    local src="$SCRIPT_DIR/kanali-patch"
+    if [ ! -f "$src/tryx-bootstrap.js" ] || [ ! -f "$src/asar-main.py" ]; then
+        warn "kanali-patch/ not found next to this script - network fix not set up"; return 1
+    fi
+    mkdir -p "$STATE_DIR"
+    install -m 0644 "$src/tryx-bootstrap.js" "$STATE_DIR/tryx-bootstrap.js"
+    install -m 0755 "$src/asar-main.py" "$STATE_DIR/asar-main.py"
+}
+
+asar_main() { python3 -I "$STATE_DIR/asar-main.py" "$RESOURCES_DIR/app.asar" "$@"; }
+
+apply_kanali_patch() {
+    [ -f "$STATE_DIR/tryx-bootstrap.js" ] && [ -f "$STATE_DIR/asar-main.py" ] && [ -f "$RESOURCES_DIR/app.asar" ] || return 0
+    cmp -s "$STATE_DIR/tryx-bootstrap.js" "$RESOURCES_DIR/tryxboot.js" || cp "$STATE_DIR/tryx-bootstrap.js" "$RESOURCES_DIR/tryxboot.js"
+    asar_main patch "$BOOT_TARGET" "$RESOURCES_DIR/tryxboot.json" >/dev/null || warn "could not apply the network fix to app.asar"
+}
+
+remove_kanali_patch() {
+    if [ -f "$STATE_DIR/asar-main.py" ] && [ -f "$RESOURCES_DIR/tryxboot.json" ] && [ -f "$RESOURCES_DIR/app.asar" ]; then
+        asar_main restore "$RESOURCES_DIR/tryxboot.json" >/dev/null || warn "could not restore app.asar's original entry point"
+    fi
+    rm -f "$RESOURCES_DIR/tryxboot.js" "$RESOURCES_DIR/tryxboot.json"
+}
+
+kanali_patch_active() {
+    [ -f "$RESOURCES_DIR/tryxboot.js" ] && [ -f "$STATE_DIR/asar-main.py" ] && [ "$(asar_main status 2>/dev/null)" = "$BOOT_TARGET" ]
 }
 
 # ---------------------------------------------------------- sensor bridge ---
@@ -334,6 +375,12 @@ cmd_install() {
     hide_installer_menu_entries
     install_launcher
 
+    info "Setting up the network fix for KANALI's main process"
+    if install_patch_files; then
+        apply_kanali_patch
+        ok "bootstrap installed (resources/tryxboot.js)"
+    fi
+
     info "Setting up the CPU/GPU temperature bridge"
     if install_sensor_files; then
         apply_sensor_shim
@@ -363,11 +410,15 @@ cmd_run() {
         esac
     done < <(scan_devices)
     cmd_register quiet
+    apply_kanali_patch
     apply_sensor_shim
     start_sensord
     wine_env
     cd "$KANALI_DIR"
-    exec wine KANALI.exe "$@"
+    mkdir -p "$STATE_DIR"
+    # Output goes to a file: with a pipe as stdout (e.g. when started from some desktop
+    # launchers), console.log in KANALI's main process fails under Wine with EBADF.
+    exec wine KANALI.exe "$@" >"$STATE_DIR/kanali-wine.log" 2>&1
 }
 
 # ----------------------------------------------------------------- doctor ---
@@ -421,6 +472,12 @@ cmd_doctor() {
     [ $any = 1 ] || bad "No Tryx cooler found on USB. Check the cooler's USB cable to the motherboard header."
 
     if kanali_installed; then
+        echo; echo "${B}Network fix (KANALI main process)${N}"
+        if kanali_patch_active; then
+            ok "bootstrap active (app.asar main -> resources/tryxboot.js)"
+        else
+            bad "bootstrap missing - GIPHY downloads and TRYX online features will fail (tryx-kanali run fixes it)"
+        fi
         echo; echo "${B}CPU/GPU temperature bridge${N}"
         sensors_report
     fi
@@ -440,6 +497,7 @@ cmd_uninstall() {
     pkill -f 'tryx-kanali/tryx-sensord' 2>/dev/null || true
     restore_original_lhm
     rm -f "$SENSOR_FILE"
+    remove_kanali_patch
     info "Removing tryx-kanali launcher and menu entry"
     rm -f "$DESKTOP_FILE" "$BIN_DIR/tryx-kanali"
     rm -rf "$STATE_DIR"

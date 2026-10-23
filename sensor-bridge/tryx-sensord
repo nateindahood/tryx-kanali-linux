@@ -280,7 +280,7 @@ def main():
         gpu = (nv.get() if nv else None) or amdgpu() or {}
         up, down = net.get()
         values = {
-            "ts": "%.0f" % time.time(),
+            "ts": str(int(time.time())),
             "cpu.name": name,
             "cpu.temp": cpu_temp(),
             "cpu.load": load.get(),

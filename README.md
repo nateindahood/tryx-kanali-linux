@@ -4,8 +4,9 @@ Run **TRYX KANALI**, the Windows-only control software for TRYX AIO coolers with
 screens (e.g. the **Panorama 360** with its 6.5" AMOLED), on **Linux** with Wine, and let it
 actually reach the cooler. You can then manage the screen and upload custom animations from Linux.
 
-Out of the box, KANALI installs and opens under Wine but never finds the cooler, and it can't
-read CPU/GPU temperatures. This project works out why and fixes both with a single setup script.
+Out of the box, KANALI installs and opens under Wine but never finds the cooler, can't read
+CPU/GPU temperatures, and all of its online features (GIPHY downloads, TRYX's online library,
+update checks) fail. This project works out why and fixes all three with a single setup script.
 
 > **Unofficial.** Not affiliated with or supported by TRYX. Use at your own risk, especially
 > anything involving firmware updates.
@@ -42,7 +43,8 @@ The installer script:
    (downloads from Microsoft, **10-20 minutes**),
 3. starts the **KANALI installer**. Click through it and keep the default location,
 4. registers your cooler with Wine and adds a **"KANALI"** entry to your app menu,
-5. sets up the **CPU/GPU temperature bridge** (keeps KANALI's original sensor library as a backup).
+5. sets up the **CPU/GPU temperature bridge** (keeps KANALI's original sensor library as a backup),
+6. installs the **network fix** for KANALI's background process (GIPHY, online library, update checks).
 
 Then start **KANALI** from the menu (or `tryx-kanali run`). If the installer already opened
 KANALI, quit it from its tray icon and start it from the menu once, so the cooler gets registered.
@@ -96,7 +98,7 @@ Tested with **TRYX Panorama 360 ARGB** (`PANO`, USB `391a:1011`, firmware **v2.0
 - ❔ Custom animation / media upload: not verified on Linux yet. It uses the same USB
   channel, so it's expected to work. Reports welcome
 - ❌ CPU package power, per-core voltages (not available without root on Linux)
-- ⚠️ TRYX online features (cloud library sync, firmware-version check) time out under Wine
+- ✅ GIPHY downloads, TRYX online material library, app/firmware update checks (via the network fix)
 
 Other TRYX screen models (Panorama SE / WB, HOLO, ...) use the same middleware and very
 likely work the same way, but are **untested**. Reports welcome! Please include the output
@@ -166,6 +168,19 @@ been written at that point, and it's recoverable:
 **shut the PC down and switch the PSU off (or unplug it) for ~15 seconds.** A normal reboot
 isn't enough, because the motherboard keeps USB powered. The cooler comes back on its previous firmware.
 
+### GIPHY downloads failed / "request timed out" errors
+That was a Wine bug, fixed by this project. KANALI's background process makes its web requests
+with a library (axios) that switches on TCP keep-alive *before* connecting. Under Wine that makes
+every connection fail instantly (`connect UNKNOWN`), and KANALI reported it as a timeout. The
+fix is a small bootstrap (`resources/tryxboot.js`) that delays keep-alive until the connection is
+up and then starts KANALI unchanged. To load it first, the one `"main"` line in
+`resources/app.asar`'s `package.json` is pointed at it (a same-size edit; the original is kept in
+`resources/tryxboot.json` and restored by `tryx-kanali uninstall`). `tryx-kanali run` re-applies
+it after KANALI updates. Details: [docs/how-it-works.md](docs/how-it-works.md#the-network-fix).
+
+You can also upload your own GIF/MP4/image: in the Panorama screen settings choose a
+customization mode and add a local file.
+
 ### Do I need ADB? I read the cooler shows up in ADB.
 No. On the old Android firmware the screen exposes ADB (it's an Android board), but KANALI
 2.x doesn't use it: its ADB path is switched off in the build. On the new firmware there's no ADB at all.
@@ -198,6 +213,7 @@ lives entirely in your home directory plus one udev rule, so it's easy to carry 
 distro: clone the repo and run `install` again.
 
 ### Where are the logs?
+`~/.local/share/tryx-kanali/kanali-wine.log` (Wine/console output) and
 `~/.wine-kanali/drive_c/users/$USER/AppData/Roaming/kanali/logs/`:
 - `udb_YYYY-MM-DD.log`: device middleware (USB traffic, device online/offline)
 - `YYYY-MM-DD.log`: KANALI app

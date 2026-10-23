@@ -97,8 +97,31 @@ by `sensor-bridge/tryx-sensord` once a second. Data older than 15 s is ignored. 
 values follow KANALI's normal path: `Screen.exe` `dynamic` → UI → `CMD_Update_UIItemText` to the
 cooler, sent every second while the screen layout contains system-info labels.
 
+## The network fix
+
+Every request from KANALI's main process (GIPHY downloads, `kanali2-api.tryxzone.com`: update
+and firmware checks, material library, usage logs) failed after ~20 ms and was logged as
+`{ type: 'canceled', respMsg: '数据请求超时' }`, KANALI's catch-all for "no response", even
+though plain `https.get` from the same process works.
+
+Attaching to the main process with `--inspect` (the `EnableNodeCliInspectArguments` fuse is on)
+and calling KANALI's own `giphy:downloadMedia` IPC handler showed the real error:
+`connect UNKNOWN 146.75.93.32:443`. The bundled axios 0.27 calls `socket.setKeepAlive(true, 60000)`
+when the request gets its socket, i.e. *before* the TCP connect. On Windows libuv applies
+`SO_KEEPALIVE`/`TCP_KEEPALIVE` at connect time, and under Wine 9 that makes `connect` fail.
+Enabling keep-alive after the `connect` event works.
+
+KANALI can't be given a `--require` (`NODE_OPTIONS` is limited in packaged Electron apps), and
+Electron 25 checks `resources/app.asar` before a `resources/app/` folder. So we edit the one value
+in `app.asar`'s `package.json`: `"main": "./out/main/index.js"` → `"main": "../tryxboot.js"`,
+padded with spaces to the same byte length so nothing else in the archive moves (asar integrity
+validation is off in this build). `tryxboot.js` patches `net.Socket.prototype.setKeepAlive` to defer
+until connected, then `require`s the original entry point recorded in `tryxboot.json`.
+`app.getAppPath()`, the app name/version and the settings folder are unchanged.
+
+Separately, `console.log` in KANALI's main process throws `EBADF` under Wine when stdout is a
+pipe, so `tryx-kanali run` sends KANALI's output to a log file.
+
 ## Known limitations
 
 - **CPU package power:** RAPL energy counters are root-only on current kernels.
-- **TRYX cloud API:** requests from KANALI under Wine time out (`数据请求超时`, "request timed out"), although the
-  API is reachable from Linux. Not investigated yet.
