@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# tryx-kanali - run Tryx KANALI (Windows-only) on Linux with Wine, and let it
+# reach Tryx coolers with built-in screens (e.g. Panorama).
+#
+# Usage:  tryx-kanali install <KANALI installer .exe or .zip>
+#         tryx-kanali run          (start KANALI; what the menu entry runs)
+#         tryx-kanali register     (re-register connected coolers with Wine)
+#         tryx-kanali doctor       (diagnose setup and cooler state)
+#         tryx-kanali uninstall
+#
+# Unofficial project, not affiliated with Tryx. https://github.com/nateindahood/tryx-kanali-linux
+
+set -euo pipefail
+
+VERSION="1.0.0"
+PREFIX="${KANALI_PREFIX:-$HOME/.wine-kanali}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+STATE_DIR="$DATA_HOME/tryx-kanali"
+BIN_DIR="$HOME/.local/bin"
+DESKTOP_FILE="$DATA_HOME/applications/tryx-kanali.desktop"
+UDEV_RULE="/etc/udev/rules.d/70-tryx-kanali.rules"
+KANALI_DIR="$PREFIX/drive_c/Program Files/KANALI"
+
+TRYX_VID="391a"
+# GUID_DEVINTERFACE_USB_DEVICE - KANALI's middleware (UDB.exe) enumerates this
+USB_DEVICE_GUID="a5dcbf10-6530-11d2-901f-00c04fb951ed"
+INSTANCE="tryxkanali"
+
+# ---------------------------------------------------------------- helpers ---
+
+if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'; else B= G= Y= R= N=; fi
+info() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+ok()   { printf '  %s✔%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*" >&2; }
+bad()  { printf '  %s✘%s %s\n' "$R" "$N" "$*"; }
+die()  { printf '%sError:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+wine_env() { export WINEPREFIX="$PREFIX" WINEDEBUG="${WINEDEBUG:--all}"; }
+
+udev_rule_content() {
+cat <<'EOF'
+# Installed by tryx-kanali (https://github.com/nateindahood/tryx-kanali-linux) - Tryx coolers with built-in screens.
+#
+# New Tryx firmware: vendor 391a. The Tryx protocol runs over a USB printer-class
+# bulk interface (Linux usblp driver). Give the logged-in user access and a stable
+# name, /dev/tryx-<product id> (e.g. /dev/tryx-1011), which the Wine shim points at.
+SUBSYSTEM=="usb", ATTR{idVendor}=="391a", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usbmisc", KERNEL=="lp*", ATTRS{idVendor}=="391a", TAG+="uaccess", SYMLINK+="tryx-$attr{idProduct}"
+#
+# Rockchip loader mode (2207:xxxx) used while flashing firmware, and the old
+# Android firmware (18d1:2d03-2d05, product "cm01"): user access so a user-session
+# VM can take the device for a firmware update; keep ModemManager away from it.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2207", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{product}=="cm01", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="18d1", ATTRS{product}=="cm01", ENV{ID_MM_DEVICE_IGNORE}="1"
+EOF
+}
+
+# Prints one line per Tryx-related USB device: "<mode> <vid> <pid> <sysfs-name> <product>"
+#   mode: tryx (new firmware), android (old firmware), loader (Rockchip flashing mode)
+scan_devices() {
+    local d vid pid prod
+    for d in /sys/bus/usb/devices/*; do
+        [ -f "$d/idVendor" ] || continue
+        vid=$(<"$d/idVendor"); pid=$(<"$d/idProduct")
+        prod=$(cat "$d/product" 2>/dev/null || true)
+        case "$vid" in
+            "$TRYX_VID") echo "tryx $vid $pid ${d##*/} ${prod:-?}" ;;
+            2207)        echo "loader $vid $pid ${d##*/} ${prod:-?}" ;;
+            18d1)        [ "$prod" = "cm01" ] && echo "android $vid $pid ${d##*/} $prod" ;;
+        esac
+    done
+    return 0
+}
+
+dosdevice_name() { echo "usb#vid_${TRYX_VID}&pid_$1#${INSTANCE}#{${USB_DEVICE_GUID}}"; }
+
+kanali_installed() { [ -f "$KANALI_DIR/KANALI.exe" ]; }
+
+# ------------------------------------------------------------ register ------
+
+# Register a Tryx device (product id, lowercase hex) with Wine so KANALI can find it:
+# a fake Windows USB device interface whose path resolves to /dev/tryx-<pid>.
+register_pid() {
+    local pid="${1,,}" PID="${1^^}" reg link
+    local key_enum="HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Enum\\USB\\VID_${TRYX_VID^^}&PID_${PID}\\${INSTANCE^^}"
+    local key_if="HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Control\\DeviceClasses\\{${USB_DEVICE_GUID^^}}\\##?#usb#vid_${TRYX_VID}&pid_${pid}#${INSTANCE}#{${USB_DEVICE_GUID}}"
+    local symlink="\\\\?\\usb#vid_${TRYX_VID}&pid_${pid}#${INSTANCE}#{${USB_DEVICE_GUID}}"
+    local hwid
+    hwid=$(printf 'USB\\VID_%s&PID_%s\0\0' "${TRYX_VID^^}" "$PID" | iconv -f UTF-8 -t UTF-16LE | od -An -tx1 -v | tr -s ' \n' ',' | sed 's/^,//;s/,$//')
+
+    mkdir -p "$STATE_DIR"
+    reg="$STATE_DIR/register-$pid.reg"
+    # .reg strings need backslashes doubled
+    cat >"$reg" <<EOF
+REGEDIT4
+
+[$key_enum]
+"Class"="USBDevice"
+"ClassGUID"="{88BAE032-5A81-49F0-BC3D-A4FF138216D6}"
+"DeviceDesc"="Tryx device ${PID}"
+"Mfg"="TRYX"
+"ConfigFlags"=dword:00000000
+"HardwareID"=hex(7):$hwid
+
+[$key_if]
+"DeviceInstance"="USB\\\\VID_${TRYX_VID^^}&PID_${PID}\\\\${INSTANCE^^}"
+
+[$key_if\\#]
+"SymbolicLink"="${symlink//\\/\\\\}"
+
+[$key_if\\#\\Control]
+"Linked"=dword:00000001
+EOF
+    wine_env
+    wine regedit "$reg" >/dev/null 2>&1 || die "Failed to import $reg into the Wine registry"
+    link="$PREFIX/dosdevices/$(dosdevice_name "$pid")"
+    ln -sfn "/dev/tryx-$pid" "$link"
+    touch "$STATE_DIR/registered-$pid"
+}
+
+cmd_register() {
+    local quiet="${1:-}" mode vid pid name prod found=0
+    [ -d "$PREFIX" ] || die "Wine prefix $PREFIX not found - run: tryx-kanali install <installer>"
+    while read -r mode vid pid name prod; do
+        [ "$mode" = tryx ] || continue
+        found=1
+        if [ -f "$STATE_DIR/registered-$pid" ] && [ -L "$PREFIX/dosdevices/$(dosdevice_name "$pid")" ]; then
+            [ -n "$quiet" ] || ok "$prod ($vid:$pid) already registered"
+            continue
+        fi
+        register_pid "$pid"
+        [ -n "$quiet" ] || ok "Registered $prod ($vid:$pid) -> /dev/tryx-$pid"
+    done < <(scan_devices)
+    if [ $found = 0 ] && [ -z "$quiet" ]; then
+        warn "No Tryx device on new firmware (USB vendor $TRYX_VID) found. Run: tryx-kanali doctor"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------- install ---
+
+install_udev_rule() {
+    local tmp
+    tmp=$(mktemp)
+    udev_rule_content >"$tmp"
+    if [ -f "$UDEV_RULE" ] && cmp -s "$tmp" "$UDEV_RULE"; then
+        ok "udev rule already installed ($UDEV_RULE)"; rm -f "$tmp"; return
+    fi
+    info "Installing udev rule $UDEV_RULE (needs sudo)"
+    sudo install -m 0644 "$tmp" "$UDEV_RULE"
+    rm -f "$tmp"
+    sudo udevadm control --reload
+    sudo udevadm trigger --subsystem-match=usb --subsystem-match=usbmisc --subsystem-match=tty
+    sleep 1
+    ok "udev rule installed"
+}
+
+dotnet_release() {
+    wine_env
+    local hex
+    hex=$(wine reg query 'HKLM\Software\Microsoft\NET Framework Setup\NDP\v4\Full' /v Release 2>/dev/null \
+        | tr -d '\r' | sed -n 's/.*REG_DWORD[[:space:]]*0x\([0-9a-fA-F]*\).*/\1/p' || true)
+    [ -n "$hex" ] && echo $((16#$hex)) || echo 0
+}
+
+hide_installer_menu_entries() {
+    # The installer adds Wine menu entries; one has a garbled (Chinese) name and runs the
+    # UNINSTALLER. Hide them; tryx-kanali adds its own "KANALI" entry instead.
+    local f
+    for f in "$DATA_HOME"/applications/wine/Programs/KANALI/*.desktop; do
+        [ -f "$f" ] || continue
+        grep -q '^NoDisplay=true' "$f" || echo 'NoDisplay=true' >>"$f"
+    done
+}
+
+install_launcher() {
+    mkdir -p "$BIN_DIR" "$(dirname "$DESKTOP_FILE")"
+    if [ "$(readlink -f "$0")" != "$(readlink -f "$BIN_DIR/tryx-kanali")" ]; then
+        install -m 0755 "$0" "$BIN_DIR/tryx-kanali"
+    fi
+    cat >"$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Name=KANALI
+Comment=Tryx cooler screen control (via Wine)
+Exec=$BIN_DIR/tryx-kanali run
+Type=Application
+Categories=Utility;
+StartupWMClass=kanali.exe
+EOF
+    command -v update-desktop-database >/dev/null && update-desktop-database "$(dirname "$DESKTOP_FILE")" 2>/dev/null || true
+    ok "Installed $BIN_DIR/tryx-kanali and a \"KANALI\" menu entry"
+    case ":$PATH:" in *":$BIN_DIR:"*) ;; *) warn "$BIN_DIR is not in your PATH; use the menu entry or the full path";; esac
+}
+
+cmd_install() {
+    local src="${1:-}" exe tmpdir="" missing=()
+    [ -n "$src" ] || die "Usage: tryx-kanali install <KANALI_Vx.y.z.exe or .zip from tryx.com>"
+    [ -f "$src" ] || die "File not found: $src"
+    src=$(readlink -f "$src")
+
+    info "Checking requirements"
+    for c in wine winetricks iconv od; do command -v "$c" >/dev/null || missing+=("$c"); done
+    [[ "$src" == *.zip ]] && ! command -v unzip >/dev/null && missing+=(unzip)
+    [ ${#missing[@]} = 0 ] || die "Missing: ${missing[*]}  (see README: Requirements)"
+    ok "$(wine --version)"
+    pgrep -f 'KANALI\\KANALI\.exe' >/dev/null && die "KANALI is running - close it (and its tray icon) first"
+
+    install_udev_rule
+
+    if [[ "$src" == *.zip ]]; then
+        tmpdir=$(mktemp -d)
+        unzip -q "$src" -d "$tmpdir"
+        exe=$(find "$tmpdir" -maxdepth 2 -iname 'KANALI*.exe' | head -1)
+        [ -n "$exe" ] || die "No KANALI*.exe inside $src"
+    else
+        exe="$src"
+    fi
+
+    wine_env
+    if [ ! -d "$PREFIX" ]; then
+        info "Creating Wine prefix $PREFIX"
+        WINEARCH=win64 wineboot -i >/dev/null 2>&1
+        wineserver -w
+    fi
+
+    # .NET first: winetricks waits for every Wine process to exit, and the KANALI
+    # installer auto-starts KANALI when it finishes, which would stall winetricks.
+    if [ "$(dotnet_release)" -ge 528040 ] 2>/dev/null; then
+        ok ".NET Framework 4.8 already installed"
+    else
+        info "Installing .NET Framework 4.8 with winetricks (downloads from Microsoft; 10-20 min)"
+        winetricks -q --unattended dotnet48
+        wineserver -w
+        [ "$(dotnet_release)" -ge 528040 ] 2>/dev/null || die ".NET 4.8 install did not complete; re-run tryx-kanali install"
+        ok ".NET Framework 4.8 installed"
+    fi
+
+    if kanali_installed; then
+        ok "KANALI already installed in the prefix (re-run the installer manually to upgrade)"
+    else
+        info "Starting the KANALI installer - click through it and keep the default location"
+        (cd "$(dirname "$exe")" && wine "$exe") >/dev/null 2>&1 || true
+        kanali_installed || die "KANALI.exe not found in $KANALI_DIR after the installer finished"
+        ok "KANALI installed"
+    fi
+    [ -n "$tmpdir" ] && rm -rf "$tmpdir"
+
+    hide_installer_menu_entries
+    install_launcher
+
+    info "Registering connected Tryx devices with Wine"
+    cmd_register
+
+    echo
+    info "Done. Start KANALI from your app menu (\"KANALI\") or run: tryx-kanali run"
+    echo "    If KANALI is already open (the installer starts it), quit it from the tray and start it again."
+    echo "    Problems? Run: tryx-kanali doctor"
+}
+
+# -------------------------------------------------------------------- run ---
+
+cmd_run() {
+    kanali_installed || die "KANALI is not installed - run: tryx-kanali install <installer>"
+    local mode vid pid name prod
+    while read -r mode vid pid name prod; do
+        case "$mode" in
+            android) command -v notify-send >/dev/null && notify-send "KANALI" \
+                "Your cooler is on old Android firmware: KANALI can't manage its screen until it gets a firmware update (see README)." || true ;;
+            loader)  command -v notify-send >/dev/null && notify-send "KANALI" \
+                "Your cooler is in Rockchip flashing mode. If it's stuck there, power the PC off at the PSU for 15 s." || true ;;
+        esac
+    done < <(scan_devices)
+    cmd_register quiet
+    wine_env
+    cd "$KANALI_DIR"
+    exec wine KANALI.exe "$@"
+}
+
+# ----------------------------------------------------------------- doctor ---
+
+cmd_doctor() {
+    local mode vid pid name prod any=0 rel log
+    echo "${B}tryx-kanali $VERSION doctor${N}"
+    echo; echo "${B}System${N}"
+    if command -v wine >/dev/null; then ok "$(wine --version)"; else bad "wine not installed"; fi
+    command -v winetricks >/dev/null && ok "winetricks found" || bad "winetricks not installed"
+    [ -f "$UDEV_RULE" ] && ok "udev rule $UDEV_RULE" || bad "udev rule missing - run: tryx-kanali install <installer>"
+    if pgrep -x ModemManager >/dev/null; then ok "ModemManager running (rule tells it to ignore the cooler)"; fi
+
+    echo; echo "${B}KANALI (Wine prefix $PREFIX)${N}"
+    if [ -d "$PREFIX" ]; then
+        ok "prefix exists"
+        kanali_installed && ok "KANALI installed: $KANALI_DIR" || bad "KANALI not installed in prefix"
+        rel=$(dotnet_release)
+        [ "${rel:-0}" -ge 528040 ] 2>/dev/null && ok ".NET 4.8 installed" || bad ".NET 4.8 missing (winetricks dotnet48)"
+    else
+        bad "prefix not found"
+    fi
+
+    echo; echo "${B}Cooler${N}"
+    while read -r mode vid pid name prod; do
+        any=1
+        case "$mode" in
+        tryx)
+            ok "$prod ($vid:$pid) on USB port $name - new Tryx firmware"
+            local ifc
+            ifc=$(cat "/sys/bus/usb/devices/$name:1.0/bInterfaceClass" 2>/dev/null || echo "?")
+            [ "$ifc" = "07" ] && ok "printer-class interface present (usblp)" \
+                || warn "interface class is $ifc, not printer (07) - this model is untested, please open an issue"
+            if [ -e "/dev/tryx-$pid" ]; then
+                if [ -r "/dev/tryx-$pid" ] && [ -w "/dev/tryx-$pid" ]; then ok "/dev/tryx-$pid accessible"
+                else bad "/dev/tryx-$pid exists but you lack read/write access (log out/in, or re-plug)"; fi
+            else
+                bad "/dev/tryx-$pid missing (udev rule not active? try: sudo udevadm trigger)"
+            fi
+            [ -L "$PREFIX/dosdevices/$(dosdevice_name "$pid")" ] && ok "registered with Wine" \
+                || bad "not registered with Wine - run: tryx-kanali register" ;;
+        android)
+            bad "$vid:$pid \"cm01\" on USB port $name - OLD Android firmware"
+            echo "      KANALI 2.x only offers a firmware migration for this, which must be done on Windows."
+            echo "      See docs/firmware-update-windows-vm.md" ;;
+        loader)
+            warn "$vid:$pid \"$prod\" on USB port $name - Rockchip flashing (loader) mode"
+            echo "      Normal during a firmware update. If stuck: shut down and switch the PSU off for ~15 s." ;;
+        esac
+    done < <(scan_devices)
+    [ $any = 1 ] || bad "No Tryx cooler found on USB. Check the cooler's USB cable to the motherboard header."
+
+    log=$(ls -t "$PREFIX"/drive_c/users/*/AppData/Roaming/kanali/logs/udb_*.log 2>/dev/null | head -1 || true)
+    if [ -n "$log" ]; then
+        echo; echo "${B}Last device events in KANALI middleware log${N} ($log)"
+        grep -E '\[Hotplug\]|Open ok|Open failed|DeviceInfo ready|not found' "$log" | tail -5 | cut -c1-200 || true
+    fi
+}
+
+# -------------------------------------------------------------- uninstall ---
+
+cmd_uninstall() {
+    local ans
+    info "Removing tryx-kanali launcher and menu entry"
+    rm -f "$DESKTOP_FILE" "$BIN_DIR/tryx-kanali"
+    rm -rf "$STATE_DIR"
+    if [ -f "$UDEV_RULE" ]; then
+        info "Removing udev rule (needs sudo)"
+        sudo rm -f "$UDEV_RULE" && sudo udevadm control --reload || warn "could not remove $UDEV_RULE"
+    fi
+    if [ -d "$PREFIX" ]; then
+        read -r -p "Also delete the Wine prefix $PREFIX (KANALI and its settings)? [y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+            WINEPREFIX="$PREFIX" wineserver -k 2>/dev/null || true
+            rm -rf "$PREFIX" "$DATA_HOME"/applications/wine/Programs/KANALI
+            ok "Wine prefix deleted"
+        fi
+    fi
+    ok "Uninstalled"
+}
+
+# ------------------------------------------------------------------- main ---
+
+case "${1:-}" in
+    install)   shift; cmd_install "$@" ;;
+    run)       shift; cmd_run "$@" ;;
+    register)  cmd_register ;;
+    doctor)    cmd_doctor ;;
+    uninstall) cmd_uninstall ;;
+    version|--version) echo "tryx-kanali $VERSION" ;;
+    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
