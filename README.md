@@ -11,6 +11,11 @@ update checks) fail. This project works out why and fixes all three with a singl
 > **Unofficial.** Not affiliated with or supported by TRYX. Use at your own risk, especially
 > anything involving firmware updates.
 
+> **Prefer no Wine at all?** [frostframe](https://github.com/nateindahood/frostframe) is a
+> native Linux command-line app that talks to the cooler screen directly: uploads, live
+> CPU/GPU readings, brightness and more. Use this project if you want KANALI's full interface,
+> or for the one-time firmware update.
+
 ---
 
 ## ⚠️ Read first
