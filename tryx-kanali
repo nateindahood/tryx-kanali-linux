@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="0.5.0"
 PREFIX="${KANALI_PREFIX:-$HOME/.wine-kanali}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 STATE_DIR="$DATA_HOME/tryx-kanali"
